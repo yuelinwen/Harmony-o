@@ -15,6 +15,7 @@
 #include "IVFScan.hpp"
 #include "order.h"
 #include "runstats.h"
+#include "backend.h"
 
 namespace harmony {
 
@@ -586,46 +587,40 @@ public:
         }
     }
 
-    // ADSampling, expressed as the one thing this code already has a place
-    // for: a factor on the pruning threshold.
+    // Resolve the backend's threshold factor once per block.
     //
-    // The exact rule compares the partial sum over D' dimensions against the
-    // full threshold, which is safe because a partial sum only grows. ADSampling
-    // instead reads the partial sum as a sample of the whole, so the fair
-    // comparison is against the threshold scaled down to D' dimensions, widened
-    // by a confidence slack:
-    //
-    //     T(D') = heapTop * (D'/d) * (1 + eps/sqrt(D'))^2
-    //
-    // which is a far tighter bar and therefore prunes much harder -- at the
-    // cost of sometimes dropping a true neighbour. The last worker in the
-    // chain has seen every dimension, so its sum is exact and its factor is 1.
-    //
-    // This assumes the dimensions it has seen are a random projection of the
-    // vector, which is only true after a random rotation; query.cpp refuses
-    // --adsampling without --rotate.
+    // The worker never learns which backend is running, and does not need
+    // to: a backend reaches it as one float per block, folded into the
+    // pruning threshold before the search loop so the inner test keeps its
+    // shape. 1.0 is the exact test and is what every backend returns for a
+    // hop that has already seen every dimension.
     //
     // D' is a per-block quantity, not a per-worker one. order.h staggers the
     // chain so that each block starts at a different worker, so this worker
     // is first in the chain for one block and third for another, and the
     // partial sum it receives covers that many slices. Reading D' off
     // rankInsideTeam instead costs almost all of the recall.
-    void setAdSampling(bool on, float eps) {
-        pruneScales.assign(info.blockCount, 1.0f);
+    //
+    // chainPos[block] + 1 and not chainPos[block], because the test runs
+    // after this worker has added its own slice.
+    //
+    // The line it prints is cheap insurance: the backend is built
+    // independently on every rank from the same argv, so a worker left on a
+    // stale binary would otherwise go on pruning exactly as before with
+    // nothing in the output to say so.
+    void setBackend(const PruningBackend& backend) {
         fillChainPos();
-        if (!on) {
-            return;
-        }
+        pruneScales.assign(info.blockCount, 1.0f);
         for (size_t block = 0; block < info.blockCount; block++) {
-            double dPrime = (double)(chainPos[block] + 1) * (double)info.block_dim;
-            if (dPrime >= (double)info.d) {
-                continue;  // stays 1: this sum is already exact
-            }
-            double slack = 1.0 + (double)eps / std::sqrt(dPrime);
-            pruneScales[block] = (float)((dPrime / (double)info.d) * slack * slack);
-            cout << GREEN << "adsampling node " << rank << " block " << block << " sees " << (size_t)dPrime
-                 << "/" << info.d << " dims, pruneScale " << pruneScales[block] << RESET << endl;
+            size_t dPrime = (size_t)(chainPos[block] + 1) * info.block_dim;
+            pruneScales[block] = backend.thresholdScale(dPrime, info.d);
         }
+        cout << GREEN << "node " << rank << " backend " << backend.name() << ", slice "
+             << info.block_dim << "/" << info.d << ", pruneScale";
+        for (size_t block = 0; block < info.blockCount; block++) {
+            cout << " " << pruneScales[block];
+        }
+        cout << RESET << endl;
     }
 
     // Where this worker sits in each block's relay chain, 0-based. The same
