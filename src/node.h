@@ -653,6 +653,16 @@ public:
     // answer this on its own.
     long long skipByPos[kMaxChainPos] = {0};
     long long compareByPos[kMaxChainPos] = {0};
+    // Killed by this hop itself, so alive leaving hop p is
+    // compare - skip - pruned. skip[p+1] should come out equal to
+    // skip[p] + pruned[p]; the two are counted on different machines, so
+    // that equality is a check on the bucketing rather than a tautology.
+    long long prunedByPos[kMaxChainPos] = {0};
+    // Split of bytesFwd by hop, and the heap the chain tail sends to the
+    // master instead. Kept apart because the second is not a forward: it is
+    // k distances and k ids per query, whatever the pruning did.
+    long long bytesByPos[kMaxChainPos] = {0};
+    long long heapBytesByPos[kMaxChainPos] = {0};
     idx_t totalSkip = 0;
     idx_t totalCompare = 0;
     // Partial distances actually put on the wire by this worker. Only the

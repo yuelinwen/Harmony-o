@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "measure.h"
 #include "tribase.h"
 #include "utils.h"
 
@@ -681,6 +682,10 @@ int main(int argc, char* argv[]) {
             stats.nprobe = nprobe;
             stats.query_time = search_time;
             printRunStats(index.lastWorkerStats, nq, search_time, recall);
+            writeMeasurements(index.lastWorkerStats, index.stalenessSum, index.stalenessMax,
+                              index.stalenessCount, index.noBoundCount,
+                              adSampling ? "adsampling" : "exact", teamCount,
+                              teamSize, nprobe, k, nq, d, search_time, recall);
             if (!dumpLabelsPath.empty()) {
                 std::ofstream out(dumpLabelsPath, std::ios::binary);
                 out.write(reinterpret_cast<const char*>(labels), nq * k * sizeof(idx_t));

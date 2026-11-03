@@ -157,6 +157,17 @@ class Index {
     // once recall is known, since the master cannot report qps and recall
     // from inside the collective.
     std::vector<WorkerStat> lastWorkerStats;
+    // Threshold staleness, one entry per vector-level stage: how much looser
+    // the threshold a team pruned a group against was than the one its own
+    // results supported by the time it finished. A single machine reheaps
+    // after every candidate and would read 0 here.
+    std::vector<float> sentThreshold;
+    std::vector<double> stalenessSum;
+    std::vector<double> stalenessMax;
+    std::vector<long long> stalenessCount;
+    // Queries that reached this stage with no usable bound at all, because
+    // the previous stage's heap was not full.
+    std::vector<long long> noBoundCount;
 };
 
 }  // namespace harmony

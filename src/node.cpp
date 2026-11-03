@@ -858,7 +858,10 @@ void GroupWorker::search(bool cut, bool minorCut) {
     stat.blockDim = (long long)info.block_dim;
     for (int pos = 0; pos < kMaxChainPos; pos++) {
         stat.skipByPos[pos] = skipByPos[pos];
+        stat.prunedByPos[pos] = prunedByPos[pos];
         stat.compareByPos[pos] = compareByPos[pos];
+        stat.bytesByPos[pos] = bytesByPos[pos];
+        stat.heapBytesByPos[pos] = heapBytesByPos[pos];
     }
     gatherWorkerStats(stat, (int)rank, (int)info.workerCount + 1);
 }
@@ -1054,9 +1057,10 @@ void GroupWorker::searchBlock(size_t blockId, size_t groupId) {
     MyStopWatch searchWatch(false, "searchBlock");
 
     size_t skip = 0;
+    size_t pruned = 0;  // newly killed here, as opposed to arriving dead
 
     size_t nt = std::min(static_cast<size_t>(omp_get_max_threads()), blockSize);
-#pragma omp parallel for reduction(+:skip)
+#pragma omp parallel for reduction(+:skip,pruned)
     for (size_t q = queryStart; q < queryStart + blockSize; q++) {
         size_t queryOffset =
             queryCompareSizePreSum[q] - queryCompareSizePreSum[queryStart];  // Offset for storing the result of query q
@@ -1109,6 +1113,7 @@ void GroupWorker::searchBlock(size_t blockId, size_t groupId) {
 
                                 if (distanceBuffer[queryOffset + curDistancePosition] > heapTops[q] * pruneScales[blockId]) {
                                     distanceBuffer[queryOffset + curDistancePosition] = INFINITY;
+                                    pruned++;
                                 } else {
                                     if(shouldSendHeap(blockId)) {
                                         if (distanceBuffer[queryOffset + curDistancePosition] < simi[0]) {
@@ -1125,6 +1130,7 @@ void GroupWorker::searchBlock(size_t blockId, size_t groupId) {
 
                                 if (distanceBuffer[queryOffset + curDistancePosition] > heapTops[q] * pruneScales[blockId]) {
                                     distanceBuffer[queryOffset + curDistancePosition] = INFINITY;
+                                    pruned++;
                                 } else {
                                     if(shouldSendHeap(blockId)) {
                                         if (distanceBuffer[queryOffset + curDistancePosition] < simi[0]) {
@@ -1195,6 +1201,7 @@ void GroupWorker::searchBlock(size_t blockId, size_t groupId) {
             pos = kMaxChainPos - 1;
         }
         skipByPos[pos] += (long long)skip;
+        prunedByPos[pos] += (long long)pruned;
         compareByPos[pos] += (long long)totalQueryCompareSize;
     }
 
@@ -1204,13 +1211,22 @@ void GroupWorker::searchBlock(size_t blockId, size_t groupId) {
     
     MyStopWatch watch(true);
     int tag = GroupWorker::getTag(groupId, blockId, info.blockCount);
+    int bytePos = chainPos[blockId];
+    if (bytePos >= kMaxChainPos) {
+        bytePos = kMaxChainPos - 1;
+    }
     if(shouldSendHeap(blockId)) {
         MPI_Send(distanceHeap[groupId].get() + blockId * blockSize * k, blockSize * k, MPI_FLOAT  , 0, tag, MPI_COMM_WORLD);
         MPI_Send(idHeap[groupId].get()       + blockId * blockSize * k, blockSize * k, MPI_INT64_T, 0, tag, MPI_COMM_WORLD);
         // init_result(METRIC_L2, blockSize * k, distanceHeap.get(), idHeap.get());
+        // The chain tail sends a heap to the master instead of partial sums:
+        // k distances plus k ids per query, and it is not a forward.
+        heapBytesByPos[bytePos] += (long long)blockSize * (long long)k *
+                                   (long long)(sizeof(float) + sizeof(idx_t));
     } else {
         MPI_Isend(distanceBuffer, totalQueryCompareSize, MPI_FLOAT, getReceiver(groupId, blockId), tag, MPI_COMM_WORLD, &sendRequests[blockId]);
         bytesFwd += (long long)totalQueryCompareSize * (long long)sizeof(float);
+        bytesByPos[bytePos] += (long long)totalQueryCompareSize * (long long)sizeof(float);
     }
     waitTime += watch.watch.elapsedSeconds();
     watch.print(format("worker({}) -> block({}) -> worker({}) transmission time", rank, blockId, getReceiver(groupId, blockId)));

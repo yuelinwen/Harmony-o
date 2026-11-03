@@ -39,6 +39,9 @@ struct WorkerStat {
     // occupied by every worker for some blocks.
     long long skipByPos[kMaxChainPos] = {0};
     long long compareByPos[kMaxChainPos] = {0};
+    long long prunedByPos[kMaxChainPos] = {0};
+    long long bytesByPos[kMaxChainPos] = {0};
+    long long heapBytesByPos[kMaxChainPos] = {0};
 };
 
 inline long long maxRssKb() {

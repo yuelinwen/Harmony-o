@@ -10,6 +10,8 @@
 #include <memory>
 #include <vector>
 
+#include <cmath>
+
 #include "rotation.h"
 
 #include "IVF.h"
@@ -1149,6 +1151,19 @@ void Index::search_group_master(size_t n, const float* queries, size_t k, float*
     MPI_Bcast(heapTops.get(), n, MPI_FLOAT, 0, MPI_COMM_WORLD);
     init_result(METRIC_L2, n * k, distances, labels);
 
+    // Threshold staleness. Every team prunes a whole group against one
+    // threshold, so by the time it finishes, its own results already support
+    // a tighter one. sentThreshold records what it was actually given; the
+    // gap is measured below, where that value is overwritten.
+    sentThreshold.assign(n, 0.0f);
+    for (size_t i = 0; i < n; i++) {
+        sentThreshold[i] = heapTops[i];
+    }
+    stalenessSum.assign(param->teamCount, 0.0);
+    stalenessMax.assign(param->teamCount, 0.0);
+    stalenessCount.assign(param->teamCount, 0);
+    noBoundCount.assign(param->teamCount, 0);
+
     watch.print("Query preparation complete, starting to receive results");
 
     bool first = false;
@@ -1179,8 +1194,57 @@ void Index::search_group_master(size_t n, const float* queries, size_t k, float*
 
             recvWatch.print(format("Received all blocks for team {} group {}", teamId, groupId));
 
+            // Where this team sat in the group's relay chain, which is the
+            // stage the gap below belongs to. The first team prunes against
+            // the warm-up guess, later ones against what earlier teams left.
+            size_t stage = 0;
+            {
+                const auto& chain = groupSearchOrder.searchedWorkerOrder[groupId];
+                for (size_t i = 0; i < chain.size(); i++) {
+                    if ((size_t)chain[i] == teamId) {
+                        stage = i;
+                        break;
+                    }
+                }
+            }
+            double gapSum = 0;
+            double gapMax = 0;
+            long long gapCount = 0;
+            long long noBound = 0;
             for (size_t q = groupId * groupSize; q < (groupId + 1) * groupSize; q++) {
+                float sent = sentThreshold[q];
+                float after = distances[q * k];
+                // heap_init fills an unused slot with FLT_MAX, and slot 0 of a
+                // max-heap is the one the threshold is read from. So a query
+                // whose previous stage found fewer than k candidates relays
+                // FLT_MAX: not a stale threshold but no threshold at all, and
+                // counted on its own rather than averaged in as a 1e38 gap.
+                const float kNoBound = 1e30f;
+                if (!(sent < kNoBound)) {
+                    noBound++;
+                } else if (std::isfinite(after) && after > 0.0f && after < kNoBound && sent >= after) {
+                    // Only when the threshold really was the looser of the
+                    // two. A warm-up guess already tighter than the final
+                    // answer is not staleness.
+                    double gap = ((double)sent - (double)after) / (double)after;
+                    gapSum += gap;
+                    gapCount++;
+                    if (gap > gapMax) {
+                        gapMax = gap;
+                    }
+                }
                 heapTops[q] = distances[q * k];
+            }
+            // Teams run concurrently in the loop above, so the per-stage
+            // accumulators are shared even though the query ranges are not.
+#pragma omp critical(staleness)
+            {
+                stalenessSum[stage] += gapSum;
+                stalenessCount[stage] += gapCount;
+                noBoundCount[stage] += noBound;
+                if (gapMax > stalenessMax[stage]) {
+                    stalenessMax[stage] = gapMax;
+                }
             }
 
             size_t receiverTeam = groupSearchOrder.sendNextWorker[teamId][groupId];
@@ -1193,6 +1257,10 @@ void Index::search_group_master(size_t n, const float* queries, size_t k, float*
                     MPI_Send(heapTops.get() + q, groupSize, MPI_FLOAT, rank, 0, MPI_COMM_WORLD);
                     MPI_Send(distances + q * k, groupSize * k, MPI_FLOAT, rank, 0, MPI_COMM_WORLD);
                     MPI_Send(labels + q * k, groupSize * k, MPI_INT64_T, rank, 0, MPI_COMM_WORLD);
+                }
+                // What the next team will prune this group against.
+                for (size_t j = 0; j < groupSize; j++) {
+                    sentThreshold[q + j] = heapTops[q + j];
                 }
                 recvWatch.print(format("Sent heap for group {} to team {}", groupId, receiverTeam));
             }
