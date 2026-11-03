@@ -840,10 +840,27 @@ void GroupWorker::search(bool cut, bool minorCut) {
     // totalWatch.print(format("node {} finished all group searches", rank));
     double totalTime = totalWatch.watch.elapsedSeconds();
     double otherTime = totalTime - waitTime - searchTime;
-    totalWatch.print(format("node({}) finished all group searches, waitTime {:.3f}s {:.2f}% searchTime {:.3f}s {:.2f}% otherTime {:.3f}s {:.2f}%", 
+    totalWatch.print(format("node({}) finished all group searches, waitTime {:.3f}s {:.2f}% searchTime {:.3f}s {:.2f}% otherTime {:.3f}s {:.2f}%",
         rank, waitTime, 100 * waitTime / totalTime, searchTime, 100 * searchTime / totalTime, otherTime, 100 * otherTime / totalTime));
 
-    
+    // The print above is what utils.h switches off, so hand the same numbers
+    // to the master instead. Collective: Index::postSearch is the other half.
+    WorkerStat stat;
+    stat.waitTime = waitTime;
+    stat.searchTime = searchTime;
+    stat.totalTime = totalTime;
+    stat.totalSkip = (long long)totalSkip;
+    stat.totalCompare = (long long)totalCompare;
+    stat.bytesFwd = bytesFwd;
+    stat.maxRssKb = maxRssKb();
+    stat.teamId = (long long)info.teamId;
+    stat.rankInsideTeam = (long long)info.rankInsideTeam;
+    stat.blockDim = (long long)info.block_dim;
+    for (int pos = 0; pos < kMaxChainPos; pos++) {
+        stat.skipByPos[pos] = skipByPos[pos];
+        stat.compareByPos[pos] = compareByPos[pos];
+    }
+    gatherWorkerStats(stat, (int)rank, (int)info.workerCount + 1);
 }
 size_t GroupWorker::getSender(idx_t groupId, idx_t blockId) {
     if(blockSearchOrder.getRecvPrevWorker(info.rankInsideTeam, blockId) == 0) {
@@ -980,7 +997,7 @@ void GroupWorker::single_thread_searchBlock(size_t n, size_t blockId, size_t gro
 
                             distanceBuffer[curDistancePosition] += dis;
 
-                            if (distanceBuffer[curDistancePosition] > heapTops[q]) {
+                            if (distanceBuffer[curDistancePosition] > heapTops[q] * pruneScales[blockId]) {
                                 distanceBuffer[curDistancePosition] = INFINITY;
                             } else {
                                 if(shouldSendHeap(blockId)) {
@@ -1090,7 +1107,7 @@ void GroupWorker::searchBlock(size_t blockId, size_t groupId) {
 
                                 distanceBuffer[queryOffset + curDistancePosition] = dis;
 
-                                if (distanceBuffer[queryOffset + curDistancePosition] > heapTops[q]) {
+                                if (distanceBuffer[queryOffset + curDistancePosition] > heapTops[q] * pruneScales[blockId]) {
                                     distanceBuffer[queryOffset + curDistancePosition] = INFINITY;
                                 } else {
                                     if(shouldSendHeap(blockId)) {
@@ -1106,7 +1123,7 @@ void GroupWorker::searchBlock(size_t blockId, size_t groupId) {
 
                                 distanceBuffer[queryOffset + curDistancePosition] += dis;
 
-                                if (distanceBuffer[queryOffset + curDistancePosition] > heapTops[q]) {
+                                if (distanceBuffer[queryOffset + curDistancePosition] > heapTops[q] * pruneScales[blockId]) {
                                     distanceBuffer[queryOffset + curDistancePosition] = INFINITY;
                                 } else {
                                     if(shouldSendHeap(blockId)) {
@@ -1169,6 +1186,18 @@ void GroupWorker::searchBlock(size_t blockId, size_t groupId) {
     skipRates[blockId] = (double)skip / totalQueryCompareSize * 100;
     totalCompare += totalQueryCompareSize;
 
+    // Same two numbers again, kept apart by where this block put this worker
+    // in the relay chain. skip is the count that arrived already INFINITY, so
+    // the bucket says how much was dead after chainPos[blockId] slices.
+    {
+        int pos = chainPos[blockId];
+        if (pos >= kMaxChainPos) {
+            pos = kMaxChainPos - 1;
+        }
+        skipByPos[pos] += (long long)skip;
+        compareByPos[pos] += (long long)totalQueryCompareSize;
+    }
+
     // Print that the data transmission for this block is starting
     uniWatch.print(
         format("worker({}) -> block({}) -> worker({}) transmission started", rank, blockId, getReceiver(groupId, blockId)), false);
@@ -1181,6 +1210,7 @@ void GroupWorker::searchBlock(size_t blockId, size_t groupId) {
         // init_result(METRIC_L2, blockSize * k, distanceHeap.get(), idHeap.get());
     } else {
         MPI_Isend(distanceBuffer, totalQueryCompareSize, MPI_FLOAT, getReceiver(groupId, blockId), tag, MPI_COMM_WORLD, &sendRequests[blockId]);
+        bytesFwd += (long long)totalQueryCompareSize * (long long)sizeof(float);
     }
     waitTime += watch.watch.elapsedSeconds();
     watch.print(format("worker({}) -> block({}) -> worker({}) transmission time", rank, blockId, getReceiver(groupId, blockId)));

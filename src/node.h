@@ -1,6 +1,7 @@
 #ifndef NODE_H
 #define NODE_H
 #include <mpi.h>
+#include <cmath>
 #include <numeric>
 #include <algorithm>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include "heap.hpp"
 #include "IVFScan.hpp"
 #include "order.h"
+#include "runstats.h"
 
 namespace harmony {
 
@@ -584,8 +586,79 @@ public:
         }
     }
 
+    // ADSampling, expressed as the one thing this code already has a place
+    // for: a factor on the pruning threshold.
+    //
+    // The exact rule compares the partial sum over D' dimensions against the
+    // full threshold, which is safe because a partial sum only grows. ADSampling
+    // instead reads the partial sum as a sample of the whole, so the fair
+    // comparison is against the threshold scaled down to D' dimensions, widened
+    // by a confidence slack:
+    //
+    //     T(D') = heapTop * (D'/d) * (1 + eps/sqrt(D'))^2
+    //
+    // which is a far tighter bar and therefore prunes much harder -- at the
+    // cost of sometimes dropping a true neighbour. The last worker in the
+    // chain has seen every dimension, so its sum is exact and its factor is 1.
+    //
+    // This assumes the dimensions it has seen are a random projection of the
+    // vector, which is only true after a random rotation; query.cpp refuses
+    // --adsampling without --rotate.
+    //
+    // D' is a per-block quantity, not a per-worker one. order.h staggers the
+    // chain so that each block starts at a different worker, so this worker
+    // is first in the chain for one block and third for another, and the
+    // partial sum it receives covers that many slices. Reading D' off
+    // rankInsideTeam instead costs almost all of the recall.
+    void setAdSampling(bool on, float eps) {
+        pruneScales.assign(info.blockCount, 1.0f);
+        fillChainPos();
+        if (!on) {
+            return;
+        }
+        for (size_t block = 0; block < info.blockCount; block++) {
+            double dPrime = (double)(chainPos[block] + 1) * (double)info.block_dim;
+            if (dPrime >= (double)info.d) {
+                continue;  // stays 1: this sum is already exact
+            }
+            double slack = 1.0 + (double)eps / std::sqrt(dPrime);
+            pruneScales[block] = (float)((dPrime / (double)info.d) * slack * slack);
+            cout << GREEN << "adsampling node " << rank << " block " << block << " sees " << (size_t)dPrime
+                 << "/" << info.d << " dims, pruneScale " << pruneScales[block] << RESET << endl;
+        }
+    }
+
+    // Where this worker sits in each block's relay chain, 0-based. The same
+    // quantity the pruning scale is built from, and the bucket the pruning
+    // counters are split by, so it is computed once for both. It is per block,
+    // not per worker, because order.h staggers the chain.
+    void fillChainPos() {
+        chainPos.assign(info.blockCount, 0);
+        for (size_t block = 0; block < info.blockCount; block++) {
+            const auto& chain = blockSearchOrder.searchedWorkerOrder[block];
+            for (size_t i = 0; i < chain.size(); i++) {
+                if ((size_t)chain[i] == info.rankInsideTeam) {
+                    chainPos[block] = (int)i;
+                    break;
+                }
+            }
+        }
+    }
+
+    std::vector<float> pruneScales;
+    std::vector<int> chainPos;
+    // totalSkip/totalCompare split by chain position, which is what paper
+    // 6.3.3 asks for: the prune rate after D' = (pos+1) * block_dim dimensions.
+    // A worker's own total mixes several positions together, so it cannot
+    // answer this on its own.
+    long long skipByPos[kMaxChainPos] = {0};
+    long long compareByPos[kMaxChainPos] = {0};
     idx_t totalSkip = 0;
     idx_t totalCompare = 0;
+    // Partial distances actually put on the wire by this worker. Only the
+    // workers that are not last in their block chain forward anything, so
+    // this stays 0 on the chain tail, which reports a heap instead.
+    long long bytesFwd = 0;
 
 private:
     void searchGroup(idx_t groupId);

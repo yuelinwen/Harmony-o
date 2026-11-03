@@ -89,6 +89,13 @@ class Index {
    
     void preSearch(size_t nb, size_t workerCount, size_t blockCount, size_t warmUpSearchList, size_t warmUpSearchListSize, Param* param, std::string path);
     void postSearch();
+    // Applies one random orthogonal basis to the base vectors, the queries
+    // and the centroids. All three, because a query reaches a cluster by its
+    // distance to the centroid: rewriting the vectors and not the centroids
+    // sends every query to the wrong clusters and still returns results that
+    // look plausible. An orthogonal basis preserves every distance, so recall
+    // has to come out unchanged -- that is what makes this the control.
+    void rotate(unsigned seed, float* queries, size_t nq);
     // Declare other search-related methods
     std::unique_ptr<IVFScanBase> get_scanner(MetricType metric, OptLevel opt_level, size_t k, EdgeDevice edge_device_enabled = EdgeDevice::EDGEDEVIVE_DISABLED);
 
@@ -146,6 +153,10 @@ class Index {
     vector<size_t> ivfCounts;
     std::unique_ptr<idx_t[]> listidqueries;
     double trainTime = 0, addTime = 0, preSearchTime = 0;
+    // Filled by postSearch from the workers' own counters; read by query.cpp
+    // once recall is known, since the master cannot report qps and recall
+    // from inside the collective.
+    std::vector<WorkerStat> lastWorkerStats;
 };
 
 }  // namespace harmony
