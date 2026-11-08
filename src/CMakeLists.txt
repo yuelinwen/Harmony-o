@@ -1,7 +1,6 @@
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 set(SRC_FILES
-    backend.cpp
     Clustering.cpp
     Index.cpp
     IVF.cpp

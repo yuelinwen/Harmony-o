@@ -15,7 +15,6 @@
 #include "IVFScan.hpp"
 #include "order.h"
 #include "runstats.h"
-#include "backend.h"
 
 namespace harmony {
 
@@ -587,46 +586,11 @@ public:
         }
     }
 
-    // Resolve the backend's threshold factor once per block.
-    //
-    // The worker never learns which backend is running, and does not need
-    // to: a backend reaches it as one float per block, folded into the
-    // pruning threshold before the search loop so the inner test keeps its
-    // shape. 1.0 is the exact test and is what every backend returns for a
-    // hop that has already seen every dimension.
-    //
-    // D' is a per-block quantity, not a per-worker one. order.h staggers the
-    // chain so that each block starts at a different worker, so this worker
-    // is first in the chain for one block and third for another, and the
-    // partial sum it receives covers that many slices. Reading D' off
-    // rankInsideTeam instead costs almost all of the recall.
-    //
-    // chainPos[block] + 1 and not chainPos[block], because the test runs
-    // after this worker has added its own slice.
-    //
-    // The line it prints is cheap insurance: the backend is built
-    // independently on every rank from the same argv, so a worker left on a
-    // stale binary would otherwise go on pruning exactly as before with
-    // nothing in the output to say so.
-    void setBackend(const PruningBackend& backend) {
-        fillChainPos();
-        pruneScales.assign(info.blockCount, 1.0f);
-        for (size_t block = 0; block < info.blockCount; block++) {
-            size_t dPrime = (size_t)(chainPos[block] + 1) * info.block_dim;
-            pruneScales[block] = backend.thresholdScale(dPrime, info.d);
-        }
-        cout << GREEN << "node " << rank << " backend " << backend.name() << ", slice "
-             << info.block_dim << "/" << info.d << ", pruneScale";
-        for (size_t block = 0; block < info.blockCount; block++) {
-            cout << " " << pruneScales[block];
-        }
-        cout << RESET << endl;
-    }
-
-    // Where this worker sits in each block's relay chain, 0-based. The same
-    // quantity the pruning scale is built from, and the bucket the pruning
-    // counters are split by, so it is computed once for both. It is per block,
-    // not per worker, because order.h staggers the chain.
+    // Where this worker sits in each block's relay chain, 0-based. The bucket
+    // the pruning counters are split by, so paper 6.3.3 can report a rate per
+    // D'. It is per block, not per worker, because order.h staggers the chain,
+    // and it must be filled before the first search or every counter lands in
+    // bucket 0.
     void fillChainPos() {
         chainPos.assign(info.blockCount, 0);
         for (size_t block = 0; block < info.blockCount; block++) {
@@ -640,7 +604,6 @@ public:
         }
     }
 
-    std::vector<float> pruneScales;
     std::vector<int> chainPos;
     // totalSkip/totalCompare split by chain position, which is what paper
     // 6.3.3 asks for: the prune rate after D' = (pos+1) * block_dim dimensions.

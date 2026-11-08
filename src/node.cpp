@@ -755,6 +755,12 @@ void GroupWorker::init(int rank, bool blockSend) {
 
     skipRates = vector<double>(info.blockCount, 0);
 
+    // The chain order is settled by here, and the pruning counters are split
+    // by it, so this is the last moment before the first search at which it
+    // can be read. Left unfilled, every counter lands in bucket 0 and paper
+    // 6.3.3 reports one rate instead of four.
+    fillChainPos();
+
     // cout << "finish init" << endl;
 
 
@@ -1000,7 +1006,7 @@ void GroupWorker::single_thread_searchBlock(size_t n, size_t blockId, size_t gro
 
                             distanceBuffer[curDistancePosition] += dis;
 
-                            if (distanceBuffer[curDistancePosition] > heapTops[q] * pruneScales[blockId]) {
+                            if (distanceBuffer[curDistancePosition] > heapTops[q]) {
                                 distanceBuffer[curDistancePosition] = INFINITY;
                             } else {
                                 if(shouldSendHeap(blockId)) {
@@ -1111,7 +1117,7 @@ void GroupWorker::searchBlock(size_t blockId, size_t groupId) {
 
                                 distanceBuffer[queryOffset + curDistancePosition] = dis;
 
-                                if (distanceBuffer[queryOffset + curDistancePosition] > heapTops[q] * pruneScales[blockId]) {
+                                if (distanceBuffer[queryOffset + curDistancePosition] > heapTops[q]) {
                                     distanceBuffer[queryOffset + curDistancePosition] = INFINITY;
                                     pruned++;
                                 } else {
@@ -1128,7 +1134,7 @@ void GroupWorker::searchBlock(size_t blockId, size_t groupId) {
 
                                 distanceBuffer[queryOffset + curDistancePosition] += dis;
 
-                                if (distanceBuffer[queryOffset + curDistancePosition] > heapTops[q] * pruneScales[blockId]) {
+                                if (distanceBuffer[queryOffset + curDistancePosition] > heapTops[q]) {
                                     distanceBuffer[queryOffset + curDistancePosition] = INFINITY;
                                     pruned++;
                                 } else {
