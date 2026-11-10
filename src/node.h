@@ -15,6 +15,7 @@
 #include "IVFScan.hpp"
 #include "order.h"
 #include "runstats.h"
+#include "backend.h"
 
 namespace harmony {
 
@@ -586,11 +587,88 @@ public:
         }
     }
 
-    // Where this worker sits in each block's relay chain, 0-based. The bucket
-    // the pruning counters are split by, so paper 6.3.3 can report a rate per
-    // D'. It is per block, not per worker, because order.h staggers the chain,
-    // and it must be filled before the first search or every counter lands in
-    // bucket 0.
+    // Resolve the backend's threshold factor once per block.
+    //
+    // The worker never learns which backend is running, and does not need
+    // to: a backend reaches it as one float per block, folded into the
+    // pruning threshold before the search loop so the inner test keeps its
+    // shape. 1.0 is the exact test and is what every backend returns for a
+    // hop that has already seen every dimension.
+    //
+    // D' is a per-block quantity, not a per-worker one. order.h staggers the
+    // chain so that each block starts at a different worker, so this worker
+    // is first in the chain for one block and third for another, and the
+    // partial sum it receives covers that many slices. Reading D' off
+    // rankInsideTeam instead costs almost all of the recall.
+    //
+    // chainPos[block] + 1 and not chainPos[block], because the test runs
+    // after this worker has added its own slice.
+    //
+    // The line it prints is cheap insurance: the backend is built
+    // independently on every rank from the same argv, so a worker left on a
+    // stale binary would otherwise go on pruning exactly as before with
+    // nothing in the output to say so.
+    void setBackend(const PruningBackend& backend) {
+        fillChainPos();
+        // The total is what the chain actually sums, not info.d. block_dim is
+        // d / teamSize in integer arithmetic, so when teamSize does not divide
+        // d the last d % teamSize dimensions are handed to nobody. Passing
+        // info.d there would leave the chain tail with dPrime < dimsTotal and
+        // hence a scale below 1.0 -- and the tail is where candidates enter
+        // the top-k heap, so an approximate threshold at that one hop drops
+        // true neighbours for good.
+        const size_t chainDims = info.teamSize * info.block_dim;
+        const size_t delta = backend.deltaD();
+        deltaDims = delta;
+
+        pruneScales.assign(info.blockCount, 1.0f);
+        chunkScales.assign(info.blockCount, std::vector<float>());
+        for (size_t block = 0; block < info.blockCount; block++) {
+            size_t before = (size_t)chainPos[block] * info.block_dim;
+            pruneScales[block] = backend.thresholdScale(before + info.block_dim, chainDims);
+            if (delta == 0) {
+                continue;  // exact backend: one call over the whole slice
+            }
+            // One scale per test inside this worker's slice, at the same
+            // boundaries dist_comp tests at. The last entry covers whatever
+            // is left when delta does not divide block_dim, and equals
+            // pruneScales[block].
+            for (size_t end = delta; end < info.block_dim; end += delta) {
+                chunkScales[block].push_back(backend.thresholdScale(before + end, chainDims));
+            }
+            chunkScales[block].push_back(pruneScales[block]);
+        }
+
+        bool degenerate = true;
+        for (size_t block = 0; block < info.blockCount && degenerate; block++) {
+            if (pruneScales[block] != 1.0f) {
+                degenerate = false;
+            }
+            for (float s : chunkScales[block]) {
+                if (s != 1.0f) {
+                    degenerate = false;
+                }
+            }
+        }
+        cout << GREEN << "node " << rank << " backend " << backend.name() << ", slice "
+             << info.block_dim << "/" << info.d << ", chainDims " << chainDims
+             << ", deltaD " << delta << ", pruneScale";
+        for (size_t block = 0; block < info.blockCount; block++) {
+            cout << " " << pruneScales[block];
+        }
+        if (chainDims != info.d) {
+            cout << " [" << (info.d - chainDims) << " dims unassigned by d/teamSize]";
+        }
+        if (degenerate) {
+            cout << " [degenerate: every scale 1.0, this is the exact test]";
+        }
+        cout << RESET << endl;
+    }
+
+    // Where this worker sits in each block's relay chain, 0-based. The same
+    // quantity the pruning scale is built from, and the bucket the pruning
+    // counters are split by, so it is computed once for both. It is per block,
+    // not per worker, because order.h staggers the chain.
     void fillChainPos() {
         chainPos.assign(info.blockCount, 0);
         for (size_t block = 0; block < info.blockCount; block++) {
@@ -604,7 +682,49 @@ public:
         }
     }
 
+    std::vector<float> pruneScales;
+    // Per block, the scale at each deltaD boundary inside this worker's
+    // slice; its last entry is pruneScales[block]. Empty for a backend that
+    // does not test inside a slice, and that emptiness is what the search
+    // loop branches on.
+    std::vector<std::vector<float>> chunkScales;
+    // The backend's deltaD, kept so the scan can rebuild the same boundaries
+    // the scales were computed at.
+    size_t deltaDims = 0;
     std::vector<int> chainPos;
+
+    // Sum one candidate's slice against the query, testing every deltaD
+    // dimensions, and return INFINITY as soon as a test rejects it.
+    //
+    // This is adsampling::dist_comp with the bookkeeping removed: the scales
+    // for this block's boundaries are already computed, the running sum
+    // arrives from the previous hop instead of starting at zero, and a
+    // rejected candidate is marked rather than returned as a negative
+    // estimate, because nothing downstream here reads an estimate.
+    //
+    // dimsDone is advanced by the dimensions actually summed, which is the
+    // point of the chunking and is not recoverable afterwards: a candidate
+    // abandoned after 32 of 196 dimensions is still one candidate, so
+    // counting candidates and multiplying by block_dim -- which is what the
+    // harness did -- reports work that was never done.
+    inline float scanSliceChunked(float running, const float* query, const float* codes,
+                                  float threshold, size_t blockId, size_t& dimsDone) const {
+        const std::vector<float>& scales = chunkScales[blockId];
+        size_t at = 0;
+        for (size_t c = 0; c < scales.size(); c++) {
+            size_t end = (c + 1) * deltaDims;
+            if (end > info.block_dim || c + 1 == scales.size()) {
+                end = info.block_dim;
+            }
+            running += calculatedEuclideanDistance(query + at, codes + at, end - at);
+            dimsDone += end - at;
+            if (running > threshold * scales[c]) {
+                return INFINITY;
+            }
+            at = end;
+        }
+        return running;
+    }
     // totalSkip/totalCompare split by chain position, which is what paper
     // 6.3.3 asks for: the prune rate after D' = (pos+1) * block_dim dimensions.
     // A worker's own total mixes several positions together, so it cannot
@@ -616,6 +736,11 @@ public:
     // skip[p] + pruned[p]; the two are counted on different machines, so
     // that equality is a check on the bucketing rather than a tautology.
     long long prunedByPos[kMaxChainPos] = {0};
+    // Dimensions this worker really summed, split the same way. With no
+    // intra-slice test it comes out equal to (compare - skip) * block_dim, so
+    // the two agreeing is a check on the counting; with one it is the only
+    // honest answer.
+    long long dimsEvalByPos[kMaxChainPos] = {0};
     // Split of bytesFwd by hop, and the heap the chain tail sends to the
     // master instead. Kept apart because the second is not a forward: it is
     // k distances and k ids per query, whatever the pruning did.

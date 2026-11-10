@@ -755,12 +755,6 @@ void GroupWorker::init(int rank, bool blockSend) {
 
     skipRates = vector<double>(info.blockCount, 0);
 
-    // The chain order is settled by here, and the pruning counters are split
-    // by it, so this is the last moment before the first search at which it
-    // can be read. Left unfilled, every counter lands in bucket 0 and paper
-    // 6.3.3 reports one rate instead of four.
-    fillChainPos();
-
     // cout << "finish init" << endl;
 
 
@@ -865,6 +859,7 @@ void GroupWorker::search(bool cut, bool minorCut) {
     for (int pos = 0; pos < kMaxChainPos; pos++) {
         stat.skipByPos[pos] = skipByPos[pos];
         stat.prunedByPos[pos] = prunedByPos[pos];
+        stat.dimsEvalByPos[pos] = dimsEvalByPos[pos];
         stat.compareByPos[pos] = compareByPos[pos];
         stat.bytesByPos[pos] = bytesByPos[pos];
         stat.heapBytesByPos[pos] = heapBytesByPos[pos];
@@ -1006,7 +1001,7 @@ void GroupWorker::single_thread_searchBlock(size_t n, size_t blockId, size_t gro
 
                             distanceBuffer[curDistancePosition] += dis;
 
-                            if (distanceBuffer[curDistancePosition] > heapTops[q]) {
+                            if (distanceBuffer[curDistancePosition] > heapTops[q] * pruneScales[blockId]) {
                                 distanceBuffer[curDistancePosition] = INFINITY;
                             } else {
                                 if(shouldSendHeap(blockId)) {
@@ -1064,9 +1059,10 @@ void GroupWorker::searchBlock(size_t blockId, size_t groupId) {
 
     size_t skip = 0;
     size_t pruned = 0;  // newly killed here, as opposed to arriving dead
+    size_t dims = 0;    // dimensions actually summed, not candidates * block_dim
 
     size_t nt = std::min(static_cast<size_t>(omp_get_max_threads()), blockSize);
-#pragma omp parallel for reduction(+:skip,pruned)
+#pragma omp parallel for reduction(+:skip,pruned,dims)
     for (size_t q = queryStart; q < queryStart + blockSize; q++) {
         size_t queryOffset =
             queryCompareSizePreSum[q] - queryCompareSizePreSum[queryStart];  // Offset for storing the result of query q
@@ -1094,8 +1090,34 @@ void GroupWorker::searchBlock(size_t blockId, size_t groupId) {
                             skip++;
                         } else {
 
-                            if(minorCut) {
+                            if(!chunkScales[blockId].empty()) {
 
+                                // The backend tests inside the slice, so the
+                                // slice is walked its way. This subsumes
+                                // minorCut: both cut a slice up to test
+                                // early, but minorCut's quarters test against
+                                // the unscaled threshold, which for an
+                                // estimating backend is the wrong one.
+                                distanceBuffer[queryOffset + curDistancePosition] =
+                                    scanSliceChunked(distanceBuffer[queryOffset + curDistancePosition],
+                                                     querys.get() + q * info.block_dim, codes,
+                                                     heapTops[q], blockId, dims);
+
+                                if (distanceBuffer[queryOffset + curDistancePosition] == INFINITY) {
+                                    pruned++;
+                                } else if(shouldSendHeap(blockId)) {
+                                    if (distanceBuffer[queryOffset + curDistancePosition] < simi[0]) {
+                                        heap_replace_top<METRIC_L2>(k, simi, idxi, distanceBuffer[queryOffset + curDistancePosition], index->lists[ivfId].get_candidate_id()[v]);
+                                    }
+                                }
+
+                            } else if(minorCut) {
+
+                                // Counted as a whole slice even when the
+                                // quarters cut it short, which is what this
+                                // counter has always done here. Only the
+                                // chunked path above counts exactly.
+                                dims += info.block_dim;
                                 float dis = distanceBuffer[queryOffset + curDistancePosition];
                                 auto candicate = codes;
                                 auto query = querys.get() + q * info.block_dim;
@@ -1117,7 +1139,7 @@ void GroupWorker::searchBlock(size_t blockId, size_t groupId) {
 
                                 distanceBuffer[queryOffset + curDistancePosition] = dis;
 
-                                if (distanceBuffer[queryOffset + curDistancePosition] > heapTops[q]) {
+                                if (distanceBuffer[queryOffset + curDistancePosition] > heapTops[q] * pruneScales[blockId]) {
                                     distanceBuffer[queryOffset + curDistancePosition] = INFINITY;
                                     pruned++;
                                 } else {
@@ -1128,13 +1150,14 @@ void GroupWorker::searchBlock(size_t blockId, size_t groupId) {
                                     } 
                                 }
                             } else {
+                                dims += info.block_dim;  // the whole slice, every time
                                 float dis = calculatedEuclideanDistance(querys.get() + q * info.block_dim,
                                                                         codes,
                                                                         info.block_dim);
 
                                 distanceBuffer[queryOffset + curDistancePosition] += dis;
 
-                                if (distanceBuffer[queryOffset + curDistancePosition] > heapTops[q]) {
+                                if (distanceBuffer[queryOffset + curDistancePosition] > heapTops[q] * pruneScales[blockId]) {
                                     distanceBuffer[queryOffset + curDistancePosition] = INFINITY;
                                     pruned++;
                                 } else {
@@ -1209,6 +1232,7 @@ void GroupWorker::searchBlock(size_t blockId, size_t groupId) {
         skipByPos[pos] += (long long)skip;
         prunedByPos[pos] += (long long)pruned;
         compareByPos[pos] += (long long)totalQueryCompareSize;
+        dimsEvalByPos[pos] += (long long)dims;
     }
 
     // Print that the data transmission for this block is starting

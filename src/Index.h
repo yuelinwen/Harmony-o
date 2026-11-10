@@ -95,6 +95,7 @@ class Index {
     // sends every query to the wrong clusters and still returns results that
     // look plausible. An orthogonal basis preserves every distance, so recall
     // has to come out unchanged -- that is what makes this the control.
+    void rotate(unsigned seed, float* queries, size_t nq);
     // Declare other search-related methods
     std::unique_ptr<IVFScanBase> get_scanner(MetricType metric, OptLevel opt_level, size_t k, EdgeDevice edge_device_enabled = EdgeDevice::EDGEDEVIVE_DISABLED);
 

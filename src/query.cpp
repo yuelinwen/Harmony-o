@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "backend.h"
 #include "measure.h"
 #include "tribase.h"
 #include "utils.h"
@@ -25,7 +26,8 @@ bool str_lower_equal(const std::string& a, const std::string& b) {
                       [](char a, char b) { return std::tolower(a) == std::tolower(b); });
 }
 
-int workerMain(int rank, bool cut, Index::SearchMode mode, bool blockSend, bool minorCut) {
+int workerMain(int rank, bool cut, Index::SearchMode mode, bool blockSend, bool minorCut,
+               const PruningBackend& backend) {
     if (mode == Index::SearchMode::DIVIDE_IVF) {
         BaseWorker worker;
         worker.init(rank);
@@ -39,6 +41,7 @@ int workerMain(int rank, bool cut, Index::SearchMode mode, bool blockSend, bool 
     } else {
         GroupWorker worker;
         worker.init(rank, blockSend);
+        worker.setBackend(backend);  // needs info, so after init
         worker.receiveQuery();
         worker.search(cut, minorCut);
         // node.postSearch();
@@ -158,9 +161,24 @@ int main(int argc, char* argv[]) {
         .help("")
         .default_value(1.0f)
         .scan<'f', float>();
+    program.add_argument("--backend")
+        .help("how pruning picks its dimensions and reads the partial sum (" + backendNames() + ")")
+        .default_value(std::string("harmony"));
+    program.add_argument("--addelta")
+        .help("dimensions between two adsampling tests, ADSampling's delta_d")
+        .default_value(32ul)
+        .action([](const std::string& value) -> size_t { return std::stoul(value); });
+    program.add_argument("--adeps")
+        .help("adsampling confidence slack")
+        .default_value(2.1f)
+        .scan<'f', float>();
     program.add_argument("--dumpLabels")
         .help("write the nq*k result ids to this file, for diffing two runs")
         .default_value(std::string(""));
+    program.add_argument("--seed")
+        .help("seed for the random basis adsampling estimates on")
+        .default_value(1u)
+        .scan<'u', unsigned>();
     try {
         program.parse_args(argc, argv);
     } catch (const std::runtime_error& err) {
@@ -187,8 +205,18 @@ int main(int argc, char* argv[]) {
     float inBalanceRatio = program.get<float>("HardInBalanceRatio");
     float inBalanceTeamRatio = program.get<float>("HardInBalanceTeamRatio");
     float brute_force_search_ratio= program.get<float>("brute_force_search_ratio");
+    unsigned seed = program.get<unsigned>("seed");
     std::string dumpLabelsPath = program.get<std::string>("dumpLabels");
-
+    // Built on every rank rather than broadcast: the workers parse the same
+    // argv, and a backend is a name plus two numbers.
+    std::string backendName = program.get<std::string>("backend");
+    std::unique_ptr<PruningBackend> backend = makeBackend(backendName, seed, program.get<float>("adeps"),
+                                                          program.get<size_t>("addelta"));
+    if (!backend) {
+        cerr << "unknown --backend " << backendName << "; pick one of " << backendNames() << endl;
+        return 1;
+    }
+    
     if ((hardInBalance && hardInBalanceTeam == 0) || (hardInBalanceTeam != 0 && !hardInBalance) ||
         inBalanceRatio > 1.0) {
         cerr << "hardInBalance and hardInBalanceTeam" << endl;
@@ -231,10 +259,22 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Only the group search applies the per-hop scale. Worker (--mode block)
+    // and BaseWorker (--mode base) test the running sum against the bare
+    // heapTops, so an estimating backend would run there, print its scales,
+    // and prune exactly as before. Refused rather than silently ignored -- a
+    // control that calls itself adsampling is worse than an error.
+    if (backend->deltaD() != 0 && searchMode != Index::SearchMode::DIVIDE_GROUP) {
+        cerr << "--backend " << backendName << " needs --mode group: it prunes on a per-hop "
+             << "scale that only the group search applies, and would otherwise run as the "
+             << "exact test under its own name" << endl;
+        return 1;
+    }
+
     if (rank != 0) {
         if (!run_faiss) {
             MPI_Barrier(MPI_COMM_WORLD);
-            workerMain(rank, pruning, searchMode, blockSend, minorCut);
+            workerMain(rank, pruning, searchMode, blockSend, minorCut, *backend);
         }
     } else {
 
@@ -597,6 +637,12 @@ int main(int argc, char* argv[]) {
             return 0;
         }
 
+        // Once, before the first search and after the groundtruth exists. The
+        // groundtruth stays valid across it: it is a list of ids, and every
+        // transform here is orthogonal, so it does not change which vectors
+        // are nearest -- only which dimensions reach which worker.
+        backend->apply(index, query.get(), nq);
+
         auto doSearch = [&](auto nprobe, auto opt_level, auto ratio, auto early_stop_flag, auto f_time,
                             float* distances, idx_t* labels, Index::Param* param) -> Stats {
             auto path = std::format("{}/{}/index/index_nlist_{}_{}.index", benchmarks_path, dataset, nlist,
@@ -656,10 +702,7 @@ int main(int argc, char* argv[]) {
             printRunStats(index.lastWorkerStats, nq, search_time, recall);
             writeMeasurements(index.lastWorkerStats, index.stalenessSum, index.stalenessMax,
                               index.stalenessCount, index.noBoundCount,
-                              // A literal, not a flag: the column is kept so rows
-                              // written before the pruning backends were removed still
-                              // join against rows written after.
-                              "harmony", teamCount,
+                              backend->name(), teamCount,
                               teamSize, nprobe, k, nq, d, search_time, recall);
             if (!dumpLabelsPath.empty()) {
                 std::ofstream out(dumpLabelsPath, std::ios::binary);

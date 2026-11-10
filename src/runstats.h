@@ -40,6 +40,10 @@ struct WorkerStat {
     long long skipByPos[kMaxChainPos] = {0};
     long long compareByPos[kMaxChainPos] = {0};
     long long prunedByPos[kMaxChainPos] = {0};
+    // Dimensions the worker really summed. A backend that tests inside a
+    // slice abandons candidates part-way through one, so candidates * blockDim
+    // counts arithmetic that never happened.
+    long long dimsEvalByPos[kMaxChainPos] = {0};
     long long bytesByPos[kMaxChainPos] = {0};
     long long heapBytesByPos[kMaxChainPos] = {0};
 };
@@ -83,7 +87,9 @@ inline void printRunStats(const std::vector<WorkerStat>& all, size_t nq, double 
         searchMax = std::max(searchMax, s.searchTime);
         skipSum += s.totalSkip;
         compareSum += s.totalCompare;
-        dimOps += (s.totalCompare - s.totalSkip) * s.blockDim;
+        for (int p = 0; p < kMaxChainPos; p++) {
+            dimOps += s.dimsEvalByPos[p];
+        }
         bytesFwd += s.bytesFwd;
         rssKb = std::max(rssKb, s.maxRssKb);
         // Every worker in a team walks the same candidate array, so counting

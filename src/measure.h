@@ -86,6 +86,7 @@ inline void writeMeasurements(const std::vector<WorkerStat>& all,
     long long compare[kMaxChainPos] = {0};
     long long bytes[kMaxChainPos] = {0};
     long long heapBytes[kMaxChainPos] = {0};
+    long long dimsEval[kMaxChainPos] = {0};
     for (size_t r = 1; r < all.size(); r++) {
         for (int p = 0; p < kMaxChainPos; p++) {
             skip[p] += all[r].skipByPos[p];
@@ -93,6 +94,7 @@ inline void writeMeasurements(const std::vector<WorkerStat>& all,
             compare[p] += all[r].compareByPos[p];
             bytes[p] += all[r].bytesByPos[p];
             heapBytes[p] += all[r].heapBytesByPos[p];
+            dimsEval[p] += all[r].dimsEvalByPos[p];
         }
     }
     long long blockDim = all[1].blockDim;
@@ -109,8 +111,10 @@ inline void writeMeasurements(const std::vector<WorkerStat>& all,
                        "dims_no_pruning,pct_of_no_pruning");
     if (f != nullptr) {
         for (int p = 0; p < hops; p++) {
-            long long live = compare[p] - skip[p];
-            long long ops = live * blockDim;
+            // The workers' own count. It equals (compare - skip) * blockDim
+            // whenever nothing abandons a slice part-way, and is smaller than
+            // it when a backend tests inside one.
+            long long ops = dimsEval[p];
             long long bare = compare[p] * blockDim;
             fprintf(f, "%s,%d,%lld,%lld,%.4f\n", id, p + 1, ops, bare,
                     (bare > 0) ? (100.0 * (double)ops / (double)bare) : 0.0);
@@ -194,7 +198,7 @@ inline void writeMeasurements(const std::vector<WorkerStat>& all,
     if (f != nullptr) {
         long long dimOps = 0, bytesFwd = 0, rssKb = 0;
         for (int p = 0; p < hops; p++) {
-            dimOps += (compare[p] - skip[p]) * blockDim;
+            dimOps += dimsEval[p];
             bytesFwd += bytes[p];
         }
         for (size_t r = 1; r < all.size(); r++) {

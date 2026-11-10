@@ -12,6 +12,7 @@
 
 #include <cmath>
 
+#include "rotation.h"
 
 #include "IVF.h"
 #include "IVFScan.hpp"
@@ -335,6 +336,25 @@ void Index::preSearch(size_t nb, size_t workerCount, size_t blockCount, size_t w
 
     uniWatch = MyStopWatch(true, "masterUniWatch", CRAN);
     uniWatch.print("master cross barrier");
+}
+
+void Index::rotate(unsigned seed, float* queries, size_t nq) {
+    MyStopWatch watch(true, "rotate", RED);
+    std::vector<float> r = makeOrthogonal(d, seed);
+
+    for (size_t listId = 0; listId < nlist; listId++) {
+        IVF& list = lists[listId];
+        rotateInPlace(list.candidate_codes.get(), list.get_list_size(), d, r);
+    }
+    rotateInPlace(centroid_codes.get(), nlist, d, r);
+    rotateInPlace(queries, nq, d, r);
+
+    // candidate_norms and candidate2centroid survive untouched: a norm and a
+    // point-to-centroid distance are both invariant under an orthogonal map,
+    // and the centroid moved with the points.
+    cout << YELLOW << format("rotated base/query/centroid with seed {} in {:.2f}s", seed,
+                             watch.watch.elapsedSeconds())
+         << RESET << endl;
 }
 
 void Index::postSearch() {
